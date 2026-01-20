@@ -1,0 +1,145 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: docker.io
+  BACKEND_IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/ec2-cicd-backend
+  FRONTEND_IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/ec2-cicd-frontend
+
+jobs:
+  # Backend CI Job
+  backend-ci:
+    name: Backend CI
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: ./backend
+        run: npm ci
+
+      - name: Run backend tests
+        working-directory: ./backend
+        run: npm test
+
+      - name: Build backend Docker image
+        run: |
+          docker build -t ${{ env.BACKEND_IMAGE_NAME }}:${{ github.sha }} ./backend
+          docker tag ${{ env.BACKEND_IMAGE_NAME }}:${{ github.sha }} ${{ env.BACKEND_IMAGE_NAME }}:latest
+
+      - name: Log in to Docker Hub
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push backend Docker image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push ${{ env.BACKEND_IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.BACKEND_IMAGE_NAME }}:latest
+
+  # Frontend CI Job
+  frontend-ci:
+    name: Frontend CI
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Run frontend tests
+        working-directory: ./frontend
+        run: npm test -- --watchAll=false
+
+      - name: Build frontend application
+        working-directory: ./frontend
+        run: npm run build
+
+      - name: Build frontend Docker image
+        run: |
+          docker build -t ${{ env.FRONTEND_IMAGE_NAME }}:${{ github.sha }} ./frontend
+          docker tag ${{ env.FRONTEND_IMAGE_NAME }}:${{ github.sha }} ${{ env.FRONTEND_IMAGE_NAME }}:latest
+
+      - name: Log in to Docker Hub
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push frontend Docker image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push ${{ env.FRONTEND_IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.FRONTEND_IMAGE_NAME }}:latest
+
+  # Security Scan
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: [backend-ci, frontend-ci]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner - Backend
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.BACKEND_IMAGE_NAME }}:latest
+          format: 'sarif'
+          output: 'trivy-backend-results.sarif'
+
+      - name: Run Trivy vulnerability scanner - Frontend
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.FRONTEND_IMAGE_NAME }}:latest
+          format: 'sarif'
+          output: 'trivy-frontend-results.sarif'
+
+  # Notify Jenkins (Optional - if using webhook)
+  notify-jenkins:
+    name: Notify Jenkins
+    runs-on: ubuntu-latest
+    needs: [backend-ci, frontend-ci]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Trigger Jenkins deployment
+        run: |
+          echo "CI Pipeline completed successfully"
+          echo "Backend Image: ${{ env.BACKEND_IMAGE_NAME }}:${{ github.sha }}"
+          echo "Frontend Image: ${{ env.FRONTEND_IMAGE_NAME }}:${{ github.sha }}"
+          echo "Jenkins can now pull these images for deployment"
+          # Uncomment to trigger Jenkins webhook
+          # curl -X POST ${{ secrets.JENKINS_WEBHOOK_URL }} \
+          #   -H "Content-Type: application/json" \
+          #   -d '{"backend_image":"${{ env.BACKEND_IMAGE_NAME }}:${{ github.sha }}","frontend_image":"${{ env.FRONTEND_IMAGE_NAME }}:${{ github.sha }}"}'

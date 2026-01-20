@@ -1,0 +1,297 @@
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_REGISTRY = 'docker.io'
+        BACKEND_IMAGE = "${env.DOCKERHUB_USERNAME}/ec2-cicd-backend"
+        FRONTEND_IMAGE = "${env.DOCKERHUB_USERNAME}/ec2-cicd-frontend"
+        DEPLOY_DIR = '/home/ec2-user/app'
+        CURRENT_ENV = 'blue'
+        NEW_ENV = 'green'
+    }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+    }
+    
+    stages {
+        stage('Preparation') {
+            steps {
+                script {
+                    echo "🚀 Starting deployment pipeline"
+                    echo "Build Number: ${env.BUILD_NUMBER}"
+                    echo "Git Commit: ${env.GIT_COMMIT}"
+                    
+                    // Determine current active environment
+                    def activeEnv = sh(
+                        script: "curl -s http://localhost/deployment-status | grep -o 'blue\\|green' || echo 'blue'",
+                        returnStdout: true
+                    ).trim()
+                    
+                    env.CURRENT_ENV = activeEnv
+                    env.NEW_ENV = (activeEnv == 'blue') ? 'green' : 'blue'
+                    
+                    echo "Current Environment: ${env.CURRENT_ENV}"
+                    echo "Target Environment: ${env.NEW_ENV}"
+                }
+            }
+        }
+        
+        stage('Pull Docker Images') {
+            steps {
+                script {
+                    echo "📦 Pulling latest Docker images"
+                    
+                    withCredentials([usernamePassword(
+                        credentialsId: 'dockerhub-credentials',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )]) {
+                        sh """
+                            echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin
+                            docker pull ${BACKEND_IMAGE}:latest
+                            docker pull ${FRONTEND_IMAGE}:latest
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy Green Environment') {
+            steps {
+                script {
+                    echo "🟢 Deploying to ${env.NEW_ENV} environment"
+                    
+                    dir(env.DEPLOY_DIR) {
+                        sh """
+                            # Set environment variables
+                            export BACKEND_IMAGE=${BACKEND_IMAGE}:latest
+                            export FRONTEND_IMAGE=${FRONTEND_IMAGE}:latest
+                            
+                            # Start green environment
+                            docker-compose -f docker-compose.prod.yml --profile ${env.NEW_ENV} up -d backend_${env.NEW_ENV} frontend_${env.NEW_ENV}
+                            
+                            echo "Waiting for containers to start..."
+                            sleep 10
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Health Check - Green') {
+            steps {
+                script {
+                    echo "🏥 Running health checks on ${env.NEW_ENV} environment"
+                    
+                    def healthCheckPassed = false
+                    def maxRetries = 12
+                    def retryCount = 0
+                    
+                    while (!healthCheckPassed && retryCount < maxRetries) {
+                        try {
+                            sh """
+                                # Check backend health
+                                docker exec backend_${env.NEW_ENV} node -e "require('http').get('http://localhost:5000/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+                                
+                                # Check frontend health
+                                docker exec frontend_${env.NEW_ENV} wget --quiet --tries=1 --spider http://localhost/ || exit 1
+                            """
+                            healthCheckPassed = true
+                            echo "✅ Health checks passed"
+                        } catch (Exception e) {
+                            retryCount++
+                            echo "⏳ Health check attempt ${retryCount}/${maxRetries} failed, retrying..."
+                            sleep 10
+                        }
+                    }
+                    
+                    if (!healthCheckPassed) {
+                        error("❌ Health checks failed after ${maxRetries} attempts")
+                    }
+                }
+            }
+        }
+        
+        stage('Smoke Tests') {
+            steps {
+                script {
+                    echo "🧪 Running smoke tests on ${env.NEW_ENV} environment"
+                    
+                    sh """
+                        # Test backend API endpoints
+                        docker exec backend_${env.NEW_ENV} node -e "
+                            const http = require('http');
+                            const endpoints = ['/api/health', '/api/users'];
+                            let passed = 0;
+                            
+                            endpoints.forEach(endpoint => {
+                                http.get('http://localhost:5000' + endpoint, (res) => {
+                                    if (res.statusCode === 200) {
+                                        console.log('✅ ' + endpoint + ' - OK');
+                                        passed++;
+                                    } else {
+                                        console.error('❌ ' + endpoint + ' - FAILED');
+                                        process.exit(1);
+                                    }
+                                    
+                                    if (passed === endpoints.length) {
+                                        console.log('All smoke tests passed');
+                                        process.exit(0);
+                                    }
+                                }).on('error', (e) => {
+                                    console.error('Error:', e.message);
+                                    process.exit(1);
+                                });
+                            });
+                        "
+                    """
+                    
+                    echo "✅ Smoke tests passed"
+                }
+            }
+        }
+        
+        stage('Switch Traffic to Green') {
+            steps {
+                script {
+                    echo "🔄 Switching traffic from ${env.CURRENT_ENV} to ${env.NEW_ENV}"
+                    
+                    dir(env.DEPLOY_DIR) {
+                        sh """
+                            # Backup current NGINX config
+                            cp nginx/nginx.prod.conf nginx/nginx.prod.conf.backup
+                            
+                            # Update NGINX config to point to green environment
+                            sed -i 's/server frontend_${env.CURRENT_ENV}:80;/# server frontend_${env.CURRENT_ENV}:80;/' nginx/nginx.prod.conf
+                            sed -i 's/# server frontend_${env.NEW_ENV}:80;/server frontend_${env.NEW_ENV}:80;/' nginx/nginx.prod.conf
+                            sed -i 's/server backend_${env.CURRENT_ENV}:5000;/# server backend_${env.CURRENT_ENV}:5000;/' nginx/nginx.prod.conf
+                            sed -i 's/# server backend_${env.NEW_ENV}:5000;/server backend_${env.NEW_ENV}:5000;/' nginx/nginx.prod.conf
+                            sed -i 's/X-Deployment-Version "${env.CURRENT_ENV}"/X-Deployment-Version "${env.NEW_ENV}"/' nginx/nginx.prod.conf
+                            
+                            # Reload NGINX
+                            docker exec nginx_prod nginx -t
+                            docker exec nginx_prod nginx -s reload
+                            
+                            echo "Traffic switched to ${env.NEW_ENV}"
+                            sleep 5
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Verify Traffic Switch') {
+            steps {
+                script {
+                    echo "✅ Verifying traffic is routing to ${env.NEW_ENV}"
+                    
+                    sh """
+                        # Verify deployment version header
+                        DEPLOYMENT_VERSION=\$(curl -s -I http://localhost/ | grep -i "X-Deployment-Version" | awk '{print \$2}' | tr -d '\\r')
+                        
+                        if [ "\$DEPLOYMENT_VERSION" = "${env.NEW_ENV}" ]; then
+                            echo "✅ Traffic successfully routed to ${env.NEW_ENV}"
+                        else
+                            echo "❌ Traffic routing verification failed"
+                            exit 1
+                        fi
+                    """
+                }
+            }
+        }
+        
+        stage('Stop Blue Environment') {
+            steps {
+                script {
+                    echo "🔵 Stopping ${env.CURRENT_ENV} environment"
+                    
+                    dir(env.DEPLOY_DIR) {
+                        sh """
+                            # Stop old environment containers
+                            docker-compose -f docker-compose.prod.yml stop backend_${env.CURRENT_ENV} frontend_${env.CURRENT_ENV}
+                            
+                            # Optional: Remove old containers (keep for quick rollback)
+                            # docker-compose -f docker-compose.prod.yml rm -f backend_${env.CURRENT_ENV} frontend_${env.CURRENT_ENV}
+                            
+                            echo "${env.CURRENT_ENV} environment stopped"
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Cleanup') {
+            steps {
+                script {
+                    echo "🧹 Cleaning up old Docker images"
+                    
+                    sh """
+                        # Remove dangling images
+                        docker image prune -f
+                        
+                        # Remove old images (keep last 3 versions)
+                        docker images ${BACKEND_IMAGE} --format "{{.ID}} {{.CreatedAt}}" | sort -rk 2 | awk 'NR>3 {print \$1}' | xargs -r docker rmi -f || true
+                        docker images ${FRONTEND_IMAGE} --format "{{.ID}} {{.CreatedAt}}" | sort -rk 2 | awk 'NR>3 {print \$1}' | xargs -r docker rmi -f || true
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo """
+            ✅ DEPLOYMENT SUCCESSFUL
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            Build: #${env.BUILD_NUMBER}
+            Environment: ${env.NEW_ENV}
+            Backend: ${BACKEND_IMAGE}:latest
+            Frontend: ${FRONTEND_IMAGE}:latest
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            """
+        }
+        
+        failure {
+            echo """
+            ❌ DEPLOYMENT FAILED - Initiating rollback
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            Build: #${env.BUILD_NUMBER}
+            Failed Stage: ${env.STAGE_NAME}
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            """
+            
+            script {
+                // Rollback to previous environment
+                dir(env.DEPLOY_DIR) {
+                    sh """
+                        echo "Rolling back to ${env.CURRENT_ENV} environment"
+                        
+                        # Restore NGINX config
+                        if [ -f nginx/nginx.prod.conf.backup ]; then
+                            cp nginx/nginx.prod.conf.backup nginx/nginx.prod.conf
+                            docker exec nginx_prod nginx -s reload
+                        fi
+                        
+                        # Restart blue environment if needed
+                        docker-compose -f docker-compose.prod.yml up -d backend_${env.CURRENT_ENV} frontend_${env.CURRENT_ENV}
+                        
+                        # Stop failed green environment
+                        docker-compose -f docker-compose.prod.yml stop backend_${env.NEW_ENV} frontend_${env.NEW_ENV}
+                        
+                        echo "Rollback completed"
+                    """
+                }
+            }
+        }
+        
+        always {
+            echo "Pipeline execution completed"
+            
+            // Clean workspace
+            cleanWs()
+        }
+    }
+}

@@ -2,7 +2,7 @@
 
 ### Visual Architecture Diagram
 
-![Architecture Diagram](./architecture-diagram.png)
+![Architecture Diagram](./diagram.png)
 
 *Complete CI/CD pipeline flow from developer to production with blue-green deployment strategy*
 

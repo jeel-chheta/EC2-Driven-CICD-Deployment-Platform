@@ -3,7 +3,8 @@ version: '3.8'
 services:
   # PostgreSQL Database
   postgres:
-    image: postgres:15-alpine
+    image: postgres:15
+    platform: linux/amd64
     container_name: postgres
     restart: unless-stopped
     environment:
@@ -69,7 +70,8 @@ services:
 
   # NGINX Reverse Proxy
   nginx:
-    image: nginx:alpine
+    image: nginx:stable
+    platform: linux/amd64
     container_name: nginx
     restart: unless-stopped
     ports:

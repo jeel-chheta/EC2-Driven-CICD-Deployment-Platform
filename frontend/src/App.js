@@ -11,7 +11,7 @@ function App() {
     useEffect(() => {
         fetchHealthStatus();
         fetchUsers();
-    }, []);
+    }, []); 
 
     const fetchHealthStatus = async () => {
         try {
